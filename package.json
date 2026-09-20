@@ -1,0 +1,36 @@
+{
+  "name": "aethelgard-protocol",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Aethelgard: Autonomous Parimutuel Clearinghouse & Dynamic Web-Consensus Matrix on GenLayer",
+  "author": "9ja_maxx <297689616+9ja-maxx@users.noreply.github.com>",
+  "contributors": [
+    "9ja_maxx (@9ja-maxx) <https://github.com/9ja-maxx>"
+  ],
+  "homepage": "https://github.com/9ja-maxx/aethelgard-protocol",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.59.0",
+    "genlayer-js": "^1.1.8",
+    "lucide-react": "^0.447.0",
+    "next": "^15.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.13",
+    "typescript": "^5.6.0"
+  }
+}
