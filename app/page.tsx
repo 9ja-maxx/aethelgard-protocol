@@ -24,7 +24,7 @@ import {
   getGenLayerClient,
   CONTRACT_ADDRESS,
 } from "../src/contract";
-import { Search, Filter, Sparkles, AlertCircle, RefreshCw } from "lucide-react";
+import { Search, Filter, Sparkles, AlertCircle, RefreshCw, PlusCircle, Shield } from "lucide-react";
 
 export default function Dashboard() {
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
@@ -93,18 +93,25 @@ export default function Dashboard() {
         });
         if (accounts && accounts[0]) {
           setWalletAddress(accounts[0]);
+          setNotification({
+            message: `Connected wallet ${accounts[0].slice(0, 6)}...${accounts[0].slice(-4)}`,
+            type: "success",
+          });
+          setTimeout(() => setNotification(null), 4000);
         }
-      } catch (err) {
-        console.error("Wallet connection failed:", err);
+      } catch (err: any) {
+        setNotification({
+          message: err?.message || "Wallet connection was rejected",
+          type: "error",
+        });
+        setTimeout(() => setNotification(null), 4000);
       }
     } else {
-      // Mock demo wallet for testing
-      setWalletAddress("0x71C8A53B9d40C922572b918B99158c54157d69Ef");
       setNotification({
-        message: "Connected demo StudioNet account (0x71C8...69Ef)",
-        type: "success",
+        message: "No Web3 wallet detected. Please install MetaMask to interact on GenLayer StudioNet.",
+        type: "error",
       });
-      setTimeout(() => setNotification(null), 4000);
+      setTimeout(() => setNotification(null), 5000);
     }
   };
 
@@ -313,12 +320,35 @@ export default function Dashboard() {
               <RefreshCw className="h-8 w-8 animate-spin text-gold-400 mb-3" />
               <p className="text-sm font-mono text-slate-400">Loading Aethelgard on-chain markets...</p>
             </div>
+          ) : markets.length === 0 ? (
+            <div className="rounded-2xl border border-slate-800/80 bg-obsidian-900/40 py-16 px-4 text-center">
+              <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl border border-gold-500/30 bg-gold-500/10 text-gold-400 shadow-gold-glow mb-4">
+                <Shield className="h-7 w-7" />
+              </div>
+              <div className="inline-flex items-center space-x-2 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-xs font-mono text-emerald-400 mb-3">
+                <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+                <span>Contract Live on StudioNet (0x4546...c50f)</span>
+              </div>
+              <h3 className="text-lg font-bold text-slate-100">No Prediction Markets Charted Yet</h3>
+              <p className="mt-2 text-xs text-slate-400 font-mono max-w-md mx-auto">
+                The Aethelgard Protocol intelligent contract is freshly deployed on GenLayer StudioNet with zero initial markets. Be the first to deploy an autonomous live-web consensus market!
+              </p>
+              <div className="mt-6">
+                <button
+                  onClick={() => setIsCreateModalOpen(true)}
+                  className="inline-flex items-center space-x-2 rounded-xl bg-gradient-to-r from-gold-500 to-amber-600 px-5 py-2.5 text-xs font-bold text-obsidian-950 shadow-gold-glow hover:brightness-110 active:scale-95 transition-all"
+                >
+                  <PlusCircle className="h-4 w-4" />
+                  <span>Create First Market</span>
+                </button>
+              </div>
+            </div>
           ) : filteredMarkets.length === 0 ? (
             <div className="rounded-2xl border border-slate-800/80 bg-obsidian-900/40 py-16 text-center">
               <AlertCircle className="mx-auto h-8 w-8 text-slate-500 mb-2" />
               <h3 className="text-base font-semibold text-slate-300">No Markets Match Filter</h3>
               <p className="mt-1 text-xs text-slate-500 font-mono">
-                Try refining your query or create a new prediction market above.
+                Try refining your query or clear your active filter.
               </p>
             </div>
           ) : (
