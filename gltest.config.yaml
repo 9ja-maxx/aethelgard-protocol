@@ -1,7 +1,7 @@
-contracts:
-  - path: contracts/AethelgardMarket.py
-    name: AethelgardMarket
-test_runner:
-  pytest_args:
-    - -v
-    - tests/direct
+networks:
+  default: studionet
+  studionet: {}
+paths:
+  contracts: contracts
+  artifacts: artifacts
+environment: .env
