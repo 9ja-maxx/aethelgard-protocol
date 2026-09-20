@@ -116,6 +116,6 @@ export async function createMarket(
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "create_market",
-    args: [title, criteria, deadlineIso, primaryUrl, secondaryUrl],
+    args: [title, criteria, primaryUrl, secondaryUrl, deadlineIso],
   });
 }

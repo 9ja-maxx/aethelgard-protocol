@@ -16,8 +16,8 @@ Key Architectural Guarantees & Standout Upgrades:
 1. O(1) Pull-Payment Claim Architecture:
    Rather than synchronously iterating through stakers in a gas-heavy push loop during resolution,
    Aethelgard transitions the market state in O(1) and exposes pull-based claim interfaces
-   (`claim_payout` and `claim_refund`). This completely eliminates out-of-gas risks, protects
-   the contract against transfer griefing, and supports unbounded staker participation.
+   (`claim_payout`, `claim_refund`, and `claim_stale_market_refund`). This completely eliminates
+   out-of-gas risks, protects the contract against transfer griefing, and supports unbounded staker participation.
 
 2. On-Chain Curated Domain Whitelist Governance:
    Resolves the rigid allowlist limitation of legacy oracles by maintaining a governance-controlled
@@ -44,9 +44,9 @@ Key Architectural Guarantees & Standout Upgrades:
    timeout has elapsed.
 """
 
+import hashlib
 import json
 import re
-import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from genlayer import *
@@ -58,24 +58,42 @@ from genlayer import *
 
 PROTOCOL_VERSION: str = "1.0.0"
 
-# Minimum window between market creation and resolution deadline (1 hour)
-MIN_DURATION_SECONDS: int = 3600
+STATUS_ACTIVE: str = "ACTIVE"
+STATUS_PENDING: str = "PENDING_RESOLUTION"
+STATUS_RESOLVED_YES: str = "RESOLVED_YES"
+STATUS_RESOLVED_NO: str = "RESOLVED_NO"
+STATUS_ANNULLED: str = "ANNULLED"
+STATUS_ABANDONED: str = "ABANDONED"
 
-# Maximum forward duration for a market deadline (365 days)
-MAX_DURATION_SECONDS: int = 31536000
+OUTCOME_PENDING: str = ""
+OUTCOME_YES: str = "YES"
+OUTCOME_NO: str = "NO"
+OUTCOME_INVALID_CRITERIA: str = "INVALID_CRITERIA"
+OUTCOME_INSUFFICIENT_EVIDENCE: str = "INSUFFICIENT_EVIDENCE"
 
-# Minimum stake threshold to prevent dust spam (0.001 GEN)
-MIN_STAKE_WEI: int = 1_000_000_000_000_000
+VALID_OUTCOMES = (
+    OUTCOME_YES,
+    OUTCOME_NO,
+    OUTCOME_INVALID_CRITERIA,
+    OUTCOME_INSUFFICIENT_EVIDENCE,
+)
 
-# Dual-gating requirements for emergency abandon escape hatch
-MIN_FAILED_ATTEMPTS_FOR_ABANDON: int = 2
-ABANDON_TIMEOUT_SECONDS: int = 259200  # 72 hours past deadline
+MAX_MARKET_CAPACITY = 5000
+MAX_TITLE_LENGTH = 300
+MAX_CRITERIA_LENGTH = 1200
+MAX_RATIONALE_LENGTH = 500
+MAX_URL_LENGTH = 500
+MAX_PROOF_SAMPLE_LENGTH = 600
 
-# Maximum allowed text length for clean evidence passed into consensus prompt
-MAX_EVIDENCE_BODY_LENGTH: int = 6000
+MIN_DURATION_SECONDS: int = 3600               # Minimum 1 hour forward deadline
+MIN_FAILED_ATTEMPTS_BEFORE_ABANDON: int = 2
+ABANDON_TIMEOUT_SECONDS: int = 259200          # 72 hours past deadline
+
+MIN_STAKE_WEI = u256(1_000_000_000_000_000)    # 0.001 GEN minimum deposit
 
 # Default initial trusted domains for authoritative verification
-INITIAL_TRUSTED_DOMAINS = (
+BASE_TRUSTED_DOMAINS = (
+    "wikipedia.org",
     "en.wikipedia.org",
     "reuters.com",
     "apnews.com",
@@ -94,68 +112,123 @@ INITIAL_TRUSTED_DOMAINS = (
 
 
 # ---------------------------------------------------------------------------
-# Market Status Taxonomy
+# Storage Schemas (Strictly GenLayer Decorated)
 # ---------------------------------------------------------------------------
 
-STATUS_ACTIVE: int = 0               # Open for staking until deadline
-STATUS_PENDING_RESOLUTION: int = 1   # Deadline passed; awaiting validator consensus
-STATUS_RESOLVED_YES: int = 2         # Decisively resolved YES; YES stakers claim pro-rata pool
-STATUS_RESOLVED_NO: int = 3          # Decisively resolved NO; NO stakers claim pro-rata pool
-STATUS_ANNULLED: int = 4             # Invalid criteria or zero winners; 100% symmetric refund
-STATUS_ABANDONED: int = 5            # Stale market escape hatch; 100% symmetric refund
-
-
-# ---------------------------------------------------------------------------
-# Data Models
-# ---------------------------------------------------------------------------
-
+@allow_storage
 @dataclass
-class MarketData:
-    market_id: u32
+class MarketRecord:
     creator: Address
     title: str
     criteria: str
     primary_url: str
     secondary_url: str
-    created_at_iso: str
-    deadline_iso: str
-    deadline_timestamp: int
-    status: int
-    
-    # Financial Escrow Accounting
-    total_yes_stake: u256
-    total_no_stake: u256
-    total_pool_volume: u256
-    total_claims_paid: u256
-    remaining_payout_pool: u256
-    unclaimed_winners_count: u32
-    
-    # Participant Counters
+    deadline: str
+    status: str
+
+    outcome: str
+    rationale: str
+    proof_hash: str
+    proof_sample: str
+    resolution_attempts: u32
+
+    yes_pool: u256
+    no_pool: u256
     yes_stakers_count: u32
     no_stakers_count: u32
-    
-    # Consensus Resolution Telemetry
-    resolution_attempts: u32
-    resolved_at_iso: str
-    consensus_outcome: str
-    consensus_rationale: str
-    evidence_proof_hash: str
-    evidence_proof_sample: str
+    unclaimed_winners_count: u32
+
+    created_at: str
+    resolved_at: str
 
 
 # ---------------------------------------------------------------------------
-# Helper Record for User Payout Claims
+# Utility & Safety Functions
 # ---------------------------------------------------------------------------
 
-@dataclass
-class UserStakeRecord:
-    yes_stake: u256
-    no_stake: u256
-    claimed: bool
+def _normalize_address(val) -> Address:
+    return val if isinstance(val, Address) else Address(val)
+
+
+def _get_execution_timestamp_iso() -> str:
+    """Reads the consensus-verified transaction timestamp from message metadata."""
+    raw = getattr(gl, "message_raw", None)
+    if isinstance(raw, dict) and "datetime" in raw:
+        return raw["datetime"]
+    nested = getattr(getattr(gl, "message", None), "raw", None)
+    if isinstance(nested, dict) and "datetime" in nested:
+        return nested["datetime"]
+    msg_dt = getattr(getattr(gl, "message", None), "datetime", None)
+    if msg_dt is not None:
+        return str(msg_dt)
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso_string(iso_str: str) -> datetime:
+    return datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+
+
+def _seconds_elapsed(start_iso: str, end_iso: str) -> float:
+    try:
+        return (_parse_iso_string(end_iso) - _parse_iso_string(start_iso)).total_seconds()
+    except Exception:
+        return -1.0
+
+
+def _is_valid_web_url(url_str: str) -> bool:
+    return url_str.startswith("http://") or url_str.startswith("https://")
+
+
+def _extract_domain(url_str: str) -> str:
+    """
+    Extracts the normalized host domain from an http(s) URL.
+    Safely strips userinfo credentials (e.g. user:pass@host) to mitigate authority spoofing.
+    """
+    if url_str.startswith("https://"):
+        segment = url_str[len("https://") :]
+    elif url_str.startswith("http://"):
+        segment = url_str[len("http://") :]
+    else:
+        return ""
+
+    for delimiter in ("/", "?", "#"):
+        pos = segment.find(delimiter)
+        if pos != -1:
+            segment = segment[:pos]
+
+    if "@" in segment:
+        segment = segment.rsplit("@", 1)[1]
+    if ":" in segment:
+        segment = segment.split(":", 1)[0]
+
+    return segment.strip().lower()
+
+
+def _extract_clean_text(html_content: str) -> str:
+    """
+    Lightweight, robust HTML text extractor.
+    Strips script, style, header, nav, and footer sections, removes HTML tags,
+    and normalizes excess whitespace so validators receive actual content.
+    """
+    if not html_content:
+        return ""
+
+    text = html_content
+    text = re.sub(r"(?is)<script.*?>.*?</script>", " ", text)
+    text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
+    text = re.sub(r"(?is)<noscript.*?>.*?</noscript>", " ", text)
+    text = re.sub(r"(?is)<nav.*?>.*?</nav>", " ", text)
+    text = re.sub(r"(?is)<header.*?>.*?</header>", " ", text)
+    text = re.sub(r"(?is)<footer.*?>.*?</footer>", " ", text)
+
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = text.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()[:6000]
 
 
 # ---------------------------------------------------------------------------
-# Intelligent Contract Implementation
+# Aethelgard Main Intelligent Contract
 # ---------------------------------------------------------------------------
 
 class AethelgardMarket(gl.Contract):
@@ -164,28 +237,50 @@ class AethelgardMarket(gl.Contract):
     """
 
     governor: Address
-    market_counter: u32
-    
-    # Primary storage maps
-    markets: TreeMap[u32, MarketData]
-    
-    # User stakes: key = f"{market_id}:{user_address_hex}" -> UserStakeRecord
-    user_stakes: TreeMap[str, UserStakeRecord]
-    
-    # Trusted domains set: key = domain -> bool
-    trusted_domains: TreeMap[str, bool]
+    next_market_id: u32
+    markets: TreeMap[u32, MarketRecord]
+    stakes: TreeMap[str, u256]
+    has_claimed: TreeMap[str, bool]
+    custom_domains: TreeMap[str, bool]
+    remaining_payout_pool: TreeMap[u32, u256]
 
     def __init__(self):
         """
         Deploy and initialize the Aethelgard Clearinghouse.
-        Sets deploying address as protocol governor and seeds trusted domain registry.
         """
-        self.governor = gl.message.sender
-        self.market_counter = u32(0)
-        
-        # Initialize default trusted domains
-        for domain in INITIAL_TRUSTED_DOMAINS:
-            self.trusted_domains[domain.lower()] = True
+        self.next_market_id = u32(0)
+        sender = getattr(gl.message, "sender_address", None)
+        if sender is not None:
+            self.governor = _normalize_address(sender)
+        else:
+            self.governor = Address("0x0000000000000000000000000000000000000000")
+
+    # -----------------------------------------------------------------------
+    # Helper Key Formatters
+    # -----------------------------------------------------------------------
+
+    def _format_stake_key(self, market_id: u32, side: str, staker_addr: Address) -> str:
+        return f"{int(market_id)}:{side}:{staker_addr.as_hex}"
+
+    def _format_claim_key(self, market_id: u32, staker_addr: Address) -> str:
+        return f"{int(market_id)}:{staker_addr.as_hex}"
+
+    def _fetch_market_or_revert(self, market_id: u32) -> MarketRecord:
+        if market_id not in self.markets:
+            raise gl.vm.UserError("NONEXISTENT_MARKET: Market ID does not exist")
+        return self.markets[market_id]
+
+    def _is_domain_authorized(self, host_domain: str) -> bool:
+        if not host_domain:
+            return False
+        # Check custom dynamic registry first
+        if self.custom_domains.get(host_domain, False):
+            return True
+        # Check base institutional domains and subdomains
+        for allowed in BASE_TRUSTED_DOMAINS:
+            if host_domain == allowed or host_domain.endswith("." + allowed):
+                return True
+        return False
 
     # -----------------------------------------------------------------------
     # Protocol Governance & Whitelist Management
@@ -193,139 +288,28 @@ class AethelgardMarket(gl.Contract):
 
     @gl.public.write
     def register_trusted_domain(self, domain: str) -> None:
-        """
-        Add an authoritative domain to the trusted source registry.
-        Only callable by the protocol governor.
-        """
-        assert gl.message.sender == self.governor, "Only governor may register trusted domains"
-        cleaned_domain = domain.strip().lower()
-        assert len(cleaned_domain) > 3, "Domain string is too short"
-        assert "." in cleaned_domain, "Domain must contain a valid TLD"
-        self.trusted_domains[cleaned_domain] = True
+        caller = _normalize_address(gl.message.sender_address)
+        if bytes(caller.as_bytes) != bytes(self.governor.as_bytes):
+            raise gl.vm.UserError("UNAUTHORIZED: Only protocol governor may register domains")
+        cleaned = domain.strip().lower()
+        if len(cleaned) < 3 or "." not in cleaned:
+            raise gl.vm.UserError("INVALID_DOMAIN: Must be a valid domain string")
+        self.custom_domains[cleaned] = True
 
     @gl.public.write
     def deprecate_trusted_domain(self, domain: str) -> None:
-        """
-        Remove an authoritative domain from the trusted source registry.
-        Only callable by the protocol governor.
-        """
-        assert gl.message.sender == self.governor, "Only governor may deprecate trusted domains"
-        cleaned_domain = domain.strip().lower()
-        self.trusted_domains[cleaned_domain] = False
+        caller = _normalize_address(gl.message.sender_address)
+        if bytes(caller.as_bytes) != bytes(self.governor.as_bytes):
+            raise gl.vm.UserError("UNAUTHORIZED: Only protocol governor may deprecate domains")
+        cleaned = domain.strip().lower()
+        self.custom_domains[cleaned] = False
 
     @gl.public.view
     def is_trusted_domain(self, domain: str) -> bool:
-        """
-        Query whether a domain is actively trusted by the protocol.
-        """
-        cleaned = domain.strip().lower()
-        return self.trusted_domains.get(cleaned, False)
+        return self._is_domain_authorized(domain.strip().lower())
 
     # -----------------------------------------------------------------------
-    # Host Sanitization & Anti-Spoofing URL Validation
-    # -----------------------------------------------------------------------
-
-    def _sanitize_and_validate_url(self, raw_url: str) -> str:
-        """
-        Defensively parse and sanitize an external URL:
-        - Rejects missing or non-HTTPS/HTTP schemes
-        - Strips embedded userinfo credentials to prevent host-spoofing
-        - Normalizes port numbers and paths
-        - Enforces that host matches or is a subdomain of an approved trusted domain
-        """
-        url = raw_url.strip()
-        assert url.startswith("http://") or url.startswith("https://"), "URL must use http or https scheme"
-        
-        # Remove scheme prefix
-        scheme_split = url.split("://", 1)
-        scheme = scheme_split[0].lower()
-        rest = scheme_split[1]
-        
-        # Disallow embedded userinfo (e.g. https://attacker:secret@trusted.org)
-        assert "@" not in rest.split("/")[0], "Embedded user credentials in URL authority are forbidden"
-        
-        # Extract host component
-        authority = rest.split("/")[0].split("?")[0].split("#")[0]
-        host = authority.split(":")[0].lower()
-        
-        assert len(host) > 0, "Invalid URL: missing host"
-        
-        # Verify host against trusted domains
-        is_approved = False
-        if self.trusted_domains.get(host, False):
-            is_approved = True
-        else:
-            # Check for allowed subdomains (e.g., world.reuters.com matches reuters.com)
-            for trusted_domain in INITIAL_TRUSTED_DOMAINS:
-                if self.trusted_domains.get(trusted_domain, False):
-                    if host.endswith("." + trusted_domain):
-                        is_approved = True
-                        break
-        
-        assert is_approved, f"Host '{host}' is not in the Aethelgard trusted domain registry"
-        return url
-
-    # -----------------------------------------------------------------------
-    # In-Contract Regex Content Sanitizer
-    # -----------------------------------------------------------------------
-
-    def _extract_clean_text(self, raw_html: str) -> str:
-        """
-        Contract-side HTML text cleansing to prevent LLM prompt token exhaustion:
-        - Strips <script>, <style>, <noscript>, <nav>, <header>, <footer> elements
-        - Removes all residual HTML tags
-        - Unescapes common HTML entities
-        - Collapses extraneous whitespace into single spaces
-        - Enforces maximum character budget ceiling
-        """
-        if not raw_html:
-            return ""
-        
-        # Strip script, style, and navigation blocks
-        text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", raw_html)
-        text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", text)
-        text = re.sub(r"(?is)<noscript[^>]*>.*?</noscript>", " ", text)
-        text = re.sub(r"(?is)<nav[^>]*>.*?</nav>", " ", text)
-        text = re.sub(r"(?is)<header[^>]*>.*?</header>", " ", text)
-        text = re.sub(r"(?is)<footer[^>]*>.*?</footer>", " ", text)
-        
-        # Remove remaining tags
-        text = re.sub(r"<[^>]+>", " ", text)
-        
-        # Unescape basic HTML entities
-        text = text.replace("&nbsp;", " ")
-        text = text.replace("&amp;", "&")
-        text = text.replace("&lt;", "<")
-        text = text.replace("&gt;", ">")
-        text = text.replace("&quot;", "\"")
-        text = text.replace("&#39;", "'")
-        
-        # Collapse whitespace
-        text = re.sub(r"\s+", " ", text).strip()
-        
-        # Truncate to maximum budget ceiling
-        if len(text) > MAX_EVIDENCE_BODY_LENGTH:
-            text = text[:MAX_EVIDENCE_BODY_LENGTH]
-            
-        return text
-
-    # -----------------------------------------------------------------------
-    # ISO-8601 & Timestamp Utilities
-    # -----------------------------------------------------------------------
-
-    def _parse_iso_to_timestamp(self, iso_str: str) -> int:
-        """
-        Convert ISO-8601 UTC timestamp string to integer unix seconds.
-        Handles trailing 'Z' and fractional second variations.
-        """
-        s = iso_str.strip()
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        return int(dt.replace(tzinfo=timezone.utc).timestamp())
-
-    # -----------------------------------------------------------------------
-    # Market Lifecycle: Creation
+    # Public Writes - Market Creation
     # -----------------------------------------------------------------------
 
     @gl.public.write
@@ -333,203 +317,173 @@ class AethelgardMarket(gl.Contract):
         self,
         title: str,
         criteria: str,
-        deadline_iso: str,
         primary_url: str,
-        secondary_url: str = "",
+        secondary_url: str,
+        deadline: str,
     ) -> u32:
-        """
-        Establish a new prediction market on the Aethelgard Clearinghouse.
-        
-        Parameters:
-        - title: Plain-English market question (10-200 chars)
-        - criteria: Unambiguous resolution conditions (20-1000 chars)
-        - deadline_iso: ISO-8601 timestamp string for staking cutoff
-        - primary_url: Authoritative primary source URL (must match trusted domain)
-        - secondary_url: Optional corroborating secondary source URL
-        """
-        title_clean = title.strip()
-        criteria_clean = criteria.strip()
-        
-        assert 10 <= len(title_clean) <= 200, "Title length must be between 10 and 200 characters"
-        assert 20 <= len(criteria_clean) <= 1000, "Criteria length must be between 20 and 1000 characters"
-        
-        validated_primary = self._sanitize_and_validate_url(primary_url)
-        validated_secondary = ""
-        if secondary_url and secondary_url.strip():
-            validated_secondary = self._sanitize_and_validate_url(secondary_url)
-            
-        now_ts = self._parse_iso_to_timestamp(gl.message.datetime)
-        deadline_ts = self._parse_iso_to_timestamp(deadline_iso)
-        
-        assert deadline_ts >= now_ts + MIN_DURATION_SECONDS, "Market deadline must be at least 1 hour into the future"
-        assert deadline_ts <= now_ts + MAX_DURATION_SECONDS, "Market deadline cannot exceed 1 year into the future"
-        
-        market_id = self.market_counter
-        self.market_counter = u32(market_id + 1)
-        
-        new_market = MarketData(
-            market_id=market_id,
-            creator=gl.message.sender,
-            title=title_clean,
-            criteria=criteria_clean,
-            primary_url=validated_primary,
-            secondary_url=validated_secondary,
-            created_at_iso=gl.message.datetime,
-            deadline_iso=deadline_iso,
-            deadline_timestamp=deadline_ts,
+        if len(self.markets) >= MAX_MARKET_CAPACITY:
+            raise gl.vm.UserError("CAPACITY_EXCEEDED: Global market limit reached")
+        if len(title) < 10 or len(title) > MAX_TITLE_LENGTH:
+            raise gl.vm.UserError("INVALID_INPUT: Title length must be between 10 and 300 characters")
+        if len(criteria) < 20 or len(criteria) > MAX_CRITERIA_LENGTH:
+            raise gl.vm.UserError("INVALID_INPUT: Criteria length must be between 20 and 1200 characters")
+
+        if not _is_valid_web_url(primary_url) or len(primary_url) > MAX_URL_LENGTH:
+            raise gl.vm.UserError("INVALID_INPUT: Primary URL must be a valid http(s) URL")
+        if not self._is_domain_authorized(_extract_domain(primary_url)):
+            raise gl.vm.UserError("UNAUTHORIZED_SOURCE: Primary source domain is not in the trusted registry")
+
+        if secondary_url and len(secondary_url.strip()) > 0:
+            if not _is_valid_web_url(secondary_url) or len(secondary_url) > MAX_URL_LENGTH:
+                raise gl.vm.UserError("INVALID_INPUT: Secondary URL must be a valid http(s) URL")
+            if not self._is_domain_authorized(_extract_domain(secondary_url)):
+                raise gl.vm.UserError("UNAUTHORIZED_SOURCE: Secondary source domain is not in the trusted registry")
+
+        current_time = _get_execution_timestamp_iso()
+        elapsed_to_deadline = _seconds_elapsed(current_time, deadline)
+        if elapsed_to_deadline < MIN_DURATION_SECONDS:
+            raise gl.vm.UserError("INVALID_DEADLINE: Deadline must be at least 1 hour into the future")
+
+        market_id = self.next_market_id
+        self.next_market_id = u32(int(market_id) + 1)
+        creator_addr = _normalize_address(gl.message.sender_address)
+
+        record = MarketRecord(
+            creator=creator_addr,
+            title=title.strip(),
+            criteria=criteria.strip(),
+            primary_url=primary_url.strip(),
+            secondary_url=secondary_url.strip() if secondary_url else "",
+            deadline=deadline,
             status=STATUS_ACTIVE,
-            total_yes_stake=u256(0),
-            total_no_stake=u256(0),
-            total_pool_volume=u256(0),
-            total_claims_paid=u256(0),
-            remaining_payout_pool=u256(0),
-            unclaimed_winners_count=u32(0),
+            outcome=OUTCOME_PENDING,
+            rationale="",
+            proof_hash="",
+            proof_sample="",
+            resolution_attempts=u32(0),
+            yes_pool=u256(0),
+            no_pool=u256(0),
             yes_stakers_count=u32(0),
             no_stakers_count=u32(0),
-            resolution_attempts=u32(0),
-            resolved_at_iso="",
-            consensus_outcome="",
-            consensus_rationale="",
-            evidence_proof_hash="",
-            evidence_proof_sample="",
+            unclaimed_winners_count=u32(0),
+            created_at=current_time,
+            resolved_at="",
         )
-        
-        self.markets[market_id] = new_market
+
+        self.markets[market_id] = record
+        self.remaining_payout_pool[market_id] = u256(0)
         return market_id
 
     # -----------------------------------------------------------------------
-    # Staking Engine (Payable Native Escrow)
+    # Public Writes - Parimutuel Staking Engine
     # -----------------------------------------------------------------------
+
+    def _execute_stake(self, market_id: u32, side: str) -> None:
+        market = self._fetch_market_or_revert(market_id)
+        if market.status != STATUS_ACTIVE:
+            raise gl.vm.UserError("MARKET_NOT_OPEN: Market is not active for staking")
+
+        current_time = _get_execution_timestamp_iso()
+        if current_time >= market.deadline:
+            raise gl.vm.UserError("DEADLINE_EXPIRED: Staking window has closed")
+
+        stake_value = gl.message.value
+        if stake_value < MIN_STAKE_WEI:
+            raise gl.vm.UserError("STAKE_TOO_LOW: Minimum deposit is 0.001 GEN")
+
+        sender_addr = _normalize_address(gl.message.sender_address)
+        stake_key = self._format_stake_key(market_id, side, sender_addr)
+        prior_stake = self.stakes.get(stake_key, u256(0))
+
+        if prior_stake == u256(0):
+            if side == "YES":
+                market.yes_stakers_count = u32(int(market.yes_stakers_count) + 1)
+            else:
+                market.no_stakers_count = u32(int(market.no_stakers_count) + 1)
+
+        self.stakes[stake_key] = u256(int(prior_stake) + int(stake_value))
+
+        if side == "YES":
+            market.yes_pool = u256(int(market.yes_pool) + int(stake_value))
+        else:
+            market.no_pool = u256(int(market.no_pool) + int(stake_value))
+
+        self.markets[market_id] = market
 
     @gl.public.write.payable
     def stake_yes(self, market_id: u32) -> None:
-        """
-        Deposit native GEN to stake on the YES outcome.
-        """
-        self._record_stake(market_id, is_yes=True)
+        self._execute_stake(market_id, "YES")
 
     @gl.public.write.payable
     def stake_no(self, market_id: u32) -> None:
-        """
-        Deposit native GEN to stake on the NO outcome.
-        """
-        self._record_stake(market_id, is_yes=False)
-
-    def _record_stake(self, market_id: u32, is_yes: bool) -> None:
-        """
-        Internal staking accounting: updates pool totals and user records.
-        """
-        assert market_id < self.market_counter, "Market does not exist"
-        market = self.markets[market_id]
-        
-        now_ts = self._parse_iso_to_timestamp(gl.message.datetime)
-        assert market.status == STATUS_ACTIVE, "Market is not active for staking"
-        assert now_ts < market.deadline_timestamp, "Staking cutoff deadline has passed"
-        
-        stake_amount = gl.message.value
-        assert stake_amount >= MIN_STAKE_WEI, f"Minimum stake threshold is {MIN_STAKE_WEI} wei"
-        
-        sender_hex = gl.message.sender.as_hex if hasattr(gl.message.sender, "as_hex") else "0x" + gl.message.sender.hex()
-        stake_key = f"{market_id}:{sender_hex}"
-        
-        current_record = self.user_stakes.get(stake_key, None)
-        if current_record is None:
-            current_record = UserStakeRecord(yes_stake=u256(0), no_stake=u256(0), claimed=False)
-            if is_yes:
-                market.yes_stakers_count = u32(market.yes_stakers_count + 1)
-            else:
-                market.no_stakers_count = u32(market.no_stakers_count + 1)
-        else:
-            # If user had 0 stake on this side, increment staker counter
-            if is_yes and current_record.yes_stake == 0:
-                market.yes_stakers_count = u32(market.yes_stakers_count + 1)
-            elif not is_yes and current_record.no_stake == 0:
-                market.no_stakers_count = u32(market.no_stakers_count + 1)
-                
-        if is_yes:
-            current_record.yes_stake = u256(current_record.yes_stake + stake_amount)
-            market.total_yes_stake = u256(market.total_yes_stake + stake_amount)
-        else:
-            current_record.no_stake = u256(current_record.no_stake + stake_amount)
-            market.total_no_stake = u256(market.total_no_stake + stake_amount)
-            
-        market.total_pool_volume = u256(market.total_pool_volume + stake_amount)
-        
-        self.user_stakes[stake_key] = current_record
-        self.markets[market_id] = market
+        self._execute_stake(market_id, "NO")
 
     # -----------------------------------------------------------------------
-    # Autonomous Resolution Consensus Engine
+    # Public Writes - Autonomous Web-Consensus Resolution
     # -----------------------------------------------------------------------
 
     @gl.public.write
     def resolve_market(self, market_id: u32) -> str:
-        """
-        Trigger autonomous multi-validator resolution for an expired prediction market.
-        
-        Validators execute live web retrieval, in-contract sanitization, and deliberate
-        via comparative equivalence principle on the categorical outcome:
-        - YES: Market criteria satisfied
-        - NO: Market criteria decisively not satisfied
-        - INVALID_CRITERIA: Resolution criteria inherently ambiguous or self-contradictory
-        - INSUFFICIENT_EVIDENCE: Source content unreachable or inconclusive (enables retry)
-        """
-        assert market_id < self.market_counter, "Market does not exist"
-        market = self.markets[market_id]
-        
-        now_ts = self._parse_iso_to_timestamp(gl.message.datetime)
-        assert now_ts >= market.deadline_timestamp, "Resolution deadline has not yet arrived"
-        assert market.status in (STATUS_ACTIVE, STATUS_PENDING_RESOLUTION), "Market is already in terminal state"
-        
-        market.status = STATUS_PENDING_RESOLUTION
-        market.resolution_attempts = u32(market.resolution_attempts + 1)
-        
-        # Execute non-deterministic web consensus
-        outcome, rationale, proof_hash, proof_sample = self._adjudicate_via_web_consensus(
-            market.title,
-            market.criteria,
-            market.primary_url,
-            market.secondary_url,
-        )
-        
-        # State transitions based on validator consensus
-        if outcome == "YES":
-            market.status = STATUS_RESOLVED_YES
-            if market.total_yes_stake == 0:
+        market = self._fetch_market_or_revert(market_id)
+        if market.status not in (STATUS_ACTIVE, STATUS_PENDING):
+            raise gl.vm.UserError("INVALID_STATE: Market is already settled or finalized")
+
+        current_time = _get_execution_timestamp_iso()
+        if current_time < market.deadline:
+            raise gl.vm.UserError("PREMATURE_RESOLUTION: Cannot resolve before the deadline has passed")
+
+        market.status = STATUS_PENDING
+        market.resolution_attempts = u32(int(market.resolution_attempts) + 1)
+
+        title = market.title
+        criteria = market.criteria
+        primary_url = market.primary_url
+        secondary_url = market.secondary_url
+
+        verdict_json = self._adjudicate_via_web_consensus(title, criteria, primary_url, secondary_url)
+        verdict = json.loads(verdict_json)
+
+        outcome = verdict.get("outcome", OUTCOME_INSUFFICIENT_EVIDENCE)
+        rationale = verdict.get("rationale", "")[:MAX_RATIONALE_LENGTH]
+        proof_hash = verdict.get("proof_hash", "")
+        proof_sample = verdict.get("proof_sample", "")
+
+        total_volume = int(market.yes_pool) + int(market.no_pool)
+
+        if outcome == OUTCOME_YES:
+            if market.yes_pool == u256(0):
                 # Zero winners: annul market to enable 100% symmetric refund
                 market.status = STATUS_ANNULLED
-                market.remaining_payout_pool = market.total_pool_volume
+                self.remaining_payout_pool[market_id] = u256(total_volume)
             else:
-                market.remaining_payout_pool = market.total_pool_volume
+                market.status = STATUS_RESOLVED_YES
                 market.unclaimed_winners_count = market.yes_stakers_count
-                
-        elif outcome == "NO":
-            market.status = STATUS_RESOLVED_NO
-            if market.total_no_stake == 0:
+                self.remaining_payout_pool[market_id] = u256(total_volume)
+
+        elif outcome == OUTCOME_NO:
+            if market.no_pool == u256(0):
                 # Zero winners: annul market to enable 100% symmetric refund
                 market.status = STATUS_ANNULLED
-                market.remaining_payout_pool = market.total_pool_volume
+                self.remaining_payout_pool[market_id] = u256(total_volume)
             else:
-                market.remaining_payout_pool = market.total_pool_volume
+                market.status = STATUS_RESOLVED_NO
                 market.unclaimed_winners_count = market.no_stakers_count
-                
-        elif outcome == "INVALID_CRITERIA":
+                self.remaining_payout_pool[market_id] = u256(total_volume)
+
+        elif outcome == OUTCOME_INVALID_CRITERIA:
             market.status = STATUS_ANNULLED
-            market.remaining_payout_pool = market.total_pool_volume
-            
-        elif outcome == "INSUFFICIENT_EVIDENCE":
-            # Retain PENDING_RESOLUTION; funds remain locked; permissionless retry allowed
-            market.status = STATUS_PENDING_RESOLUTION
-        else:
-            # Fallback for unexpected outcome string
-            market.status = STATUS_PENDING_RESOLUTION
-            
-        market.resolved_at_iso = gl.message.datetime
-        market.consensus_outcome = outcome
-        market.consensus_rationale = rationale
-        market.evidence_proof_hash = proof_hash
-        market.evidence_proof_sample = proof_sample
-        
+            self.remaining_payout_pool[market_id] = u256(total_volume)
+
+        elif outcome == OUTCOME_INSUFFICIENT_EVIDENCE:
+            # Safe escrow lock: funds remain untouched, retries permitted
+            market.status = STATUS_PENDING
+
+        market.outcome = outcome
+        market.rationale = rationale
+        market.proof_hash = proof_hash
+        market.proof_sample = proof_sample
+        market.resolved_at = current_time
+
         self.markets[market_id] = market
         return outcome
 
@@ -543,19 +497,15 @@ class AethelgardMarket(gl.Contract):
         criteria: str,
         primary_url: str,
         secondary_url: str,
-    ) -> tuple[str, str, str, str]:
-        """
-        Executes live-web fetching inside non-deterministic block and runs
-        comparative equivalence consensus over independent validator opinions.
-        """
+    ) -> str:
         def _fetch_and_deliberate() -> str:
-            # 1. Non-deterministic web retrieval
+            primary_body = ""
             try:
-                primary_resp = gl.nondet.web.get(primary_url)
-                primary_body = primary_resp.get("body", "") if isinstance(primary_resp, dict) else getattr(primary_resp, "body", "")
+                resp = gl.nondet.web.get(primary_url)
+                primary_body = resp.get("body", "") if isinstance(resp, dict) else getattr(resp, "body", "")
             except Exception:
                 primary_body = ""
-                
+
             secondary_body = ""
             if secondary_url:
                 try:
@@ -563,27 +513,24 @@ class AethelgardMarket(gl.Contract):
                     secondary_body = sec_resp.get("body", "") if isinstance(sec_resp, dict) else getattr(sec_resp, "body", "")
                 except Exception:
                     secondary_body = ""
-                    
-            # 2. In-contract text cleaning
-            clean_primary = self._extract_clean_text(primary_body)
-            clean_secondary = self._extract_clean_text(secondary_body)
-            
-            combined_evidence = f"PRIMARY SOURCE ({primary_url}):\n{clean_primary}"
+
+            clean_primary = _extract_clean_text(primary_body)
+            clean_secondary = _extract_clean_text(secondary_body)
+
+            combined_evidence = f"PRIMARY EVIDENCE ({primary_url}):\n{clean_primary}"
             if clean_secondary:
-                combined_evidence += f"\n\nSECONDARY SOURCE ({secondary_url}):\n{clean_secondary}"
-                
+                combined_evidence += f"\n\nSECONDARY EVIDENCE ({secondary_url}):\n{clean_secondary}"
+
             if len(combined_evidence.strip()) < 50:
                 return json.dumps({
-                    "outcome": "INSUFFICIENT_EVIDENCE",
-                    "rationale": "Source URL returned insufficient or empty content body.",
+                    "outcome": OUTCOME_INSUFFICIENT_EVIDENCE,
+                    "rationale": "Source URL returned empty or unreachable body.",
                     "proof_sample": "EMPTY_SOURCE",
                 })
-                
-            # 3. Cryptographic evidence digest
+
             proof_hash = hashlib.sha256(combined_evidence.encode("utf-8")).hexdigest()
-            proof_sample = combined_evidence[:600]
-            
-            # 4. Prompt injection hardened evaluation prompt
+            proof_sample = combined_evidence[:MAX_PROOF_SAMPLE_LENGTH]
+
             eval_prompt = f"""You are an impartial, high-integrity prediction market adjudication validator.
 Your objective is to determine the verifiable truth of a prediction market outcome based strictly on verified web evidence.
 
@@ -612,18 +559,17 @@ Respond ONLY with a valid JSON object matching this schema:
 }}"""
 
             raw_opinion = gl.nondet.exec_prompt(eval_prompt)
-            
-            # Defensive JSON parse
+
             try:
                 parsed = json.loads(raw_opinion)
-                outcome = str(parsed.get("outcome", "INSUFFICIENT_EVIDENCE")).upper().strip()
-                if outcome not in ("YES", "NO", "INVALID_CRITERIA", "INSUFFICIENT_EVIDENCE"):
-                    outcome = "INSUFFICIENT_EVIDENCE"
-                rationale = str(parsed.get("rationale", "Adjudicated from web evidence."))[:500]
+                outcome = str(parsed.get("outcome", OUTCOME_INSUFFICIENT_EVIDENCE)).upper().strip()
+                if outcome not in VALID_OUTCOMES:
+                    outcome = OUTCOME_INSUFFICIENT_EVIDENCE
+                rationale = str(parsed.get("rationale", "Adjudicated from web evidence."))[:MAX_RATIONALE_LENGTH]
             except Exception:
-                outcome = "INSUFFICIENT_EVIDENCE"
-                rationale = "Unparseable validator JSON opinion."
-                
+                outcome = OUTCOME_INSUFFICIENT_EVIDENCE
+                rationale = "Unparseable validator JSON response."
+
             return json.dumps({
                 "outcome": outcome,
                 "rationale": rationale,
@@ -631,303 +577,291 @@ Respond ONLY with a valid JSON object matching this schema:
                 "proof_sample": proof_sample,
             })
 
-        # Comparative Equivalence Consensus
         consensus_prompt = """Compare the validator adjudication outputs.
 Validators must agree on the categorical 'outcome' ('YES', 'NO', 'INVALID_CRITERIA', 'INSUFFICIENT_EVIDENCE').
 Natural minor variations in phrasing within 'rationale' are acceptable as long as the factual conclusion aligns.
 Output true if the categorical outcomes are identical; otherwise false."""
 
-        consensus_json = gl.eq_principle.prompt_comparative(_fetch_and_deliberate, consensus_prompt)
-        
-        try:
-            result = json.loads(consensus_json)
-            return (
-                result.get("outcome", "INSUFFICIENT_EVIDENCE"),
-                result.get("rationale", "Settled via comparative validator consensus."),
-                result.get("proof_hash", ""),
-                result.get("proof_sample", ""),
-            )
-        except Exception:
-            return ("INSUFFICIENT_EVIDENCE", "Consensus deserialization fallback.", "", "")
+        return gl.eq_principle.prompt_comparative(_fetch_and_deliberate, consensus_prompt)
 
     # -----------------------------------------------------------------------
-    # O(1) Pull-Payment Claim Architecture
+    # Public Writes - O(1) Pull-Payment Claim Ledger
     # -----------------------------------------------------------------------
 
     @gl.public.write
     def claim_payout(self, market_id: u32) -> u256:
-        """
-        Pull-payment claim for winning stakers on decisive markets (RESOLVED_YES / RESOLVED_NO).
-        
-        Calculates exact pro-rata share of total pool volume:
-        payout = (user_stake * total_pool) / winning_pool
-        
-        Incorporates dynamic dust remainder sweeping for the final claimer to ensure
-        100% solvency invariant: total_claims_paid == total_pool_volume.
-        """
-        assert market_id < self.market_counter, "Market does not exist"
-        market = self.markets[market_id]
-        
-        assert market.status in (STATUS_RESOLVED_YES, STATUS_RESOLVED_NO), "Market is not resolved decisively"
-        
-        sender_hex = gl.message.sender.as_hex if hasattr(gl.message.sender, "as_hex") else "0x" + gl.message.sender.hex()
-        stake_key = f"{market_id}:{sender_hex}"
-        
-        user_record = self.user_stakes.get(stake_key, None)
-        assert user_record is not None, "No stake record found for caller"
-        assert not user_record.claimed, "Winnings have already been claimed"
-        
-        # Determine winning stake and winning pool
-        is_yes_win = (market.status == STATUS_RESOLVED_YES)
-        user_winning_stake = user_record.yes_stake if is_yes_win else user_record.no_stake
-        winning_pool = market.total_yes_stake if is_yes_win else market.total_no_stake
-        
-        assert user_winning_stake > 0, "Caller holds zero stake on the winning outcome"
-        assert winning_pool > 0, "Corrupted state: winning pool is zero"
-        
-        # Compute pro-rata payout
-        # If this is the final winning staker, sweep all remaining pool funds (dust handling)
-        if market.unclaimed_winners_count <= 1:
-            payout_amount = market.remaining_payout_pool
+        market = self._fetch_market_or_revert(market_id)
+        if market.status not in (STATUS_RESOLVED_YES, STATUS_RESOLVED_NO):
+            raise gl.vm.UserError("MARKET_NOT_DECISIVE: Market is not settled decisively")
+
+        sender_addr = _normalize_address(gl.message.sender_address)
+        claim_key = self._format_claim_key(market_id, sender_addr)
+        if self.has_claimed.get(claim_key, False):
+            raise gl.vm.UserError("ALREADY_CLAIMED: Caller has already claimed payout")
+
+        winning_side = "YES" if market.status == STATUS_RESOLVED_YES else "NO"
+        user_stake_val = int(self.stakes.get(self._format_stake_key(market_id, winning_side, sender_addr), u256(0)))
+        if user_stake_val == 0:
+            raise gl.vm.UserError("NO_WINNING_STAKE: Caller holds zero stake on the winning side")
+
+        winning_pool = int(market.yes_pool) if winning_side == "YES" else int(market.no_pool)
+        total_volume = int(market.yes_pool) + int(market.no_pool)
+        rem_pool = int(self.remaining_payout_pool.get(market_id, u256(0)))
+
+        # Final winner absorbs remainder dust
+        if int(market.unclaimed_winners_count) <= 1:
+            payout_amount = rem_pool
         else:
-            payout_amount = u256((user_winning_stake * market.total_pool_volume) // winning_pool)
-            # Guard against edge-case rounding overflow
-            if payout_amount > market.remaining_payout_pool:
-                payout_amount = market.remaining_payout_pool
-                
-        assert payout_amount > 0, "Payout amount must be strictly positive"
-        
+            payout_amount = (user_stake_val * total_volume) // winning_pool
+            if payout_amount > rem_pool:
+                payout_amount = rem_pool
+
+        if payout_amount <= 0:
+            raise gl.vm.UserError("INVALID_PAYOUT: Payout calculation resulted in zero wei")
+
         # Checks-Effects-Interactions
-        user_record.claimed = True
-        market.remaining_payout_pool = u256(market.remaining_payout_pool - payout_amount)
-        market.total_claims_paid = u256(market.total_claims_paid + payout_amount)
-        if market.unclaimed_winners_count > 0:
-            market.unclaimed_winners_count = u32(market.unclaimed_winners_count - 1)
-            
-        self.user_stakes[stake_key] = user_record
+        self.has_claimed[claim_key] = True
+        self.remaining_payout_pool[market_id] = u256(rem_pool - payout_amount)
+        if int(market.unclaimed_winners_count) > 0:
+            market.unclaimed_winners_count = u32(int(market.unclaimed_winners_count) - 1)
         self.markets[market_id] = market
-        
-        # Execute transfer
-        _Payee = gl.contract_interface(Address)
-        _Payee(gl.message.sender).emit_transfer(value=payout_amount)
-        
-        return payout_amount
+
+        _Payee(sender_addr).emit_transfer(value=u256(payout_amount))
+        return u256(payout_amount)
 
     @gl.public.write
     def claim_refund(self, market_id: u32) -> u256:
-        """
-        Pull-payment claim for symmetric 100% refund on ANNULLED markets (invalid criteria
-        or zero winners on winning side).
-        """
-        assert market_id < self.market_counter, "Market does not exist"
-        market = self.markets[market_id]
-        
-        assert market.status == STATUS_ANNULLED, "Market is not annulled"
-        
-        sender_hex = gl.message.sender.as_hex if hasattr(gl.message.sender, "as_hex") else "0x" + gl.message.sender.hex()
-        stake_key = f"{market_id}:{sender_hex}"
-        
-        user_record = self.user_stakes.get(stake_key, None)
-        assert user_record is not None, "No stake record found for caller"
-        assert not user_record.claimed, "Refund has already been claimed"
-        
-        total_user_stake = u256(user_record.yes_stake + user_record.no_stake)
-        assert total_user_stake > 0, "Caller holds zero stake in this market"
-        
-        # Checks-Effects-Interactions
-        user_record.claimed = True
-        market.remaining_payout_pool = u256(market.remaining_payout_pool - total_user_stake)
-        market.total_claims_paid = u256(market.total_claims_paid + total_user_stake)
-        
-        self.user_stakes[stake_key] = user_record
-        self.markets[market_id] = market
-        
-        # Execute transfer
-        _Payee = gl.contract_interface(Address)
-        _Payee(gl.message.sender).emit_transfer(value=total_user_stake)
-        
-        return total_user_stake
+        market = self._fetch_market_or_revert(market_id)
+        if market.status != STATUS_ANNULLED:
+            raise gl.vm.UserError("NOT_ANNULLED: Market is not annulled")
 
-    # -----------------------------------------------------------------------
-    # Deterministic Emergency Escape Hatch
-    # -----------------------------------------------------------------------
+        sender_addr = _normalize_address(gl.message.sender_address)
+        claim_key = self._format_claim_key(market_id, sender_addr)
+        if self.has_claimed.get(claim_key, False):
+            raise gl.vm.UserError("ALREADY_CLAIMED: Caller has already claimed refund")
+
+        yes_stake = int(self.stakes.get(self._format_stake_key(market_id, "YES", sender_addr), u256(0)))
+        no_stake = int(self.stakes.get(self._format_stake_key(market_id, "NO", sender_addr), u256(0)))
+        total_user_deposit = yes_stake + no_stake
+
+        if total_user_deposit == 0:
+            raise gl.vm.UserError("ZERO_DEPOSIT: Caller holds zero deposits in this market")
+
+        rem_pool = int(self.remaining_payout_pool.get(market_id, u256(0)))
+        refund_amount = min(total_user_deposit, rem_pool)
+
+        # Checks-Effects-Interactions
+        self.has_claimed[claim_key] = True
+        self.remaining_payout_pool[market_id] = u256(rem_pool - refund_amount)
+
+        _Payee(sender_addr).emit_transfer(value=u256(refund_amount))
+        return u256(refund_amount)
 
     @gl.public.write
     def claim_stale_market_refund(self, market_id: u32) -> u256:
-        """
-        Permissionless dual-gated escape hatch for permanently stalled markets.
-        
-        If resolution attempts have failed >= 2 times and 72 hours have elapsed
-        past the deadline, any staker can transition the market to ABANDONED and
-        claim a 100% refund of their staked GEN.
-        """
-        assert market_id < self.market_counter, "Market does not exist"
-        market = self.markets[market_id]
-        
-        # Check eligibility for abandonment
+        market = self._fetch_market_or_revert(market_id)
+
         if market.status != STATUS_ABANDONED:
-            assert market.status == STATUS_PENDING_RESOLUTION, "Market is not in pending resolution state"
-            assert market.resolution_attempts >= MIN_FAILED_ATTEMPTS_FOR_ABANDON, (
-                f"Requires at least {MIN_FAILED_ATTEMPTS_FOR_ABANDON} failed resolution attempts before abandonment"
-            )
-            now_ts = self._parse_iso_to_timestamp(gl.message.datetime)
-            assert now_ts >= market.deadline_timestamp + ABANDON_TIMEOUT_SECONDS, (
-                f"Emergency abandon timeout requires {ABANDON_TIMEOUT_SECONDS} seconds (72h) past deadline"
-            )
+            if market.status != STATUS_PENDING:
+                raise gl.vm.UserError("NOT_STALE: Market is not pending resolution")
+            if int(market.resolution_attempts) < MIN_FAILED_ATTEMPTS_BEFORE_ABANDON:
+                raise gl.vm.UserError("ABANDON_RESTRICTED: Requires at least 2 failed resolution attempts")
+
+            current_time = _get_execution_timestamp_iso()
+            if _seconds_elapsed(market.deadline, current_time) < ABANDON_TIMEOUT_SECONDS:
+                raise gl.vm.UserError("ABANDON_RESTRICTED: 72-hour grace period has not elapsed")
+
             # Transition to ABANDONED
             market.status = STATUS_ABANDONED
-            market.remaining_payout_pool = market.total_pool_volume
-            
-        sender_hex = gl.message.sender.as_hex if hasattr(gl.message.sender, "as_hex") else "0x" + gl.message.sender.hex()
-        stake_key = f"{market_id}:{sender_hex}"
-        
-        user_record = self.user_stakes.get(stake_key, None)
-        assert user_record is not None, "No stake record found for caller"
-        assert not user_record.claimed, "Refund has already been claimed"
-        
-        total_user_stake = u256(user_record.yes_stake + user_record.no_stake)
-        assert total_user_stake > 0, "Caller holds zero stake in this market"
-        
-        # Checks-Effects-Interactions
-        user_record.claimed = True
-        market.remaining_payout_pool = u256(market.remaining_payout_pool - total_user_stake)
-        market.total_claims_paid = u256(market.total_claims_paid + total_user_stake)
-        
-        self.user_stakes[stake_key] = user_record
-        self.markets[market_id] = market
-        
-        # Execute transfer
-        _Payee = gl.contract_interface(Address)
-        _Payee(gl.message.sender).emit_transfer(value=total_user_stake)
-        
-        return total_user_stake
+            total_volume = int(market.yes_pool) + int(market.no_pool)
+            self.remaining_payout_pool[market_id] = u256(total_volume)
+            self.markets[market_id] = market
+
+        sender_addr = _normalize_address(gl.message.sender_address)
+        claim_key = self._format_claim_key(market_id, sender_addr)
+        if self.has_claimed.get(claim_key, False):
+            raise gl.vm.UserError("ALREADY_CLAIMED: Caller has already claimed refund")
+
+        yes_stake = int(self.stakes.get(self._format_stake_key(market_id, "YES", sender_addr), u256(0)))
+        no_stake = int(self.stakes.get(self._format_stake_key(market_id, "NO", sender_addr), u256(0)))
+        total_user_deposit = yes_stake + no_stake
+
+        if total_user_deposit == 0:
+            raise gl.vm.UserError("ZERO_DEPOSIT: Caller holds zero deposits in this market")
+
+        rem_pool = int(self.remaining_payout_pool.get(market_id, u256(0)))
+        refund_amount = min(total_user_deposit, rem_pool)
+
+        self.has_claimed[claim_key] = True
+        self.remaining_payout_pool[market_id] = u256(rem_pool - refund_amount)
+
+        _Payee(sender_addr).emit_transfer(value=u256(refund_amount))
+        return u256(refund_amount)
 
     # -----------------------------------------------------------------------
-    # Comprehensive View Methods for Web Client & Telemetry
+    # Public Views
     # -----------------------------------------------------------------------
 
-    @gl.public.view
-    def get_market(self, market_id: u32) -> dict:
-        """
-        Query comprehensive metadata, pool stakes, odds, and consensus telemetry.
-        """
-        assert market_id < self.market_counter, "Market does not exist"
-        m = self.markets[market_id]
-        
-        creator_hex = m.creator.as_hex if hasattr(m.creator, "as_hex") else "0x" + m.creator.hex()
-        
-        # Calculate dynamic parimutuel odds percentage
+    def _serialize_market(self, market_id: u32, market: MarketRecord) -> dict:
+        total_volume = int(market.yes_pool) + int(market.no_pool)
         yes_percent = 50
         no_percent = 50
-        if m.total_pool_volume > 0:
-            yes_percent = int((m.total_yes_stake * 100) // m.total_pool_volume)
+        if total_volume > 0:
+            yes_percent = int((int(market.yes_pool) * 100) // total_volume)
             no_percent = 100 - yes_percent
-            
+
+        status_map = {
+            STATUS_ACTIVE: 0,
+            STATUS_PENDING: 1,
+            STATUS_RESOLVED_YES: 2,
+            STATUS_RESOLVED_NO: 3,
+            STATUS_ANNULLED: 4,
+            STATUS_ABANDONED: 5,
+        }
+        status_code = status_map.get(market.status, 0)
+        deadline_ts = 0
+        try:
+            deadline_ts = int(_parse_iso_string(market.deadline).timestamp())
+        except Exception:
+            deadline_ts = 0
+
+        rem_pool = self.remaining_payout_pool.get(market_id, u256(0))
+        claims_paid = u256(max(0, total_volume - int(rem_pool)))
+
         return {
-            "market_id": int(m.market_id),
-            "creator": creator_hex,
-            "title": m.title,
-            "criteria": m.criteria,
-            "primary_url": m.primary_url,
-            "secondary_url": m.secondary_url,
-            "created_at_iso": m.created_at_iso,
-            "deadline_iso": m.deadline_iso,
-            "deadline_timestamp": int(m.deadline_timestamp),
-            "status": int(m.status),
-            "total_yes_stake": str(m.total_yes_stake),
-            "total_no_stake": str(m.total_no_stake),
-            "total_pool_volume": str(m.total_pool_volume),
-            "total_claims_paid": str(m.total_claims_paid),
-            "remaining_payout_pool": str(m.remaining_payout_pool),
-            "unclaimed_winners_count": int(m.unclaimed_winners_count),
-            "yes_stakers_count": int(m.yes_stakers_count),
-            "no_stakers_count": int(m.no_stakers_count),
+            "market_id": int(market_id),
+            "creator": market.creator.as_hex,
+            "title": market.title,
+            "criteria": market.criteria,
+            "primary_url": market.primary_url,
+            "secondary_url": market.secondary_url,
+            "deadline": market.deadline,
+            "deadline_iso": market.deadline,
+            "deadline_timestamp": deadline_ts,
+            "status": status_code,
+            "status_str": market.status,
+            "outcome": market.outcome,
+            "consensus_outcome": market.outcome,
+            "rationale": market.rationale,
+            "consensus_rationale": market.rationale,
+            "proof_hash": market.proof_hash,
+            "evidence_proof_hash": market.proof_hash,
+            "proof_sample": market.proof_sample,
+            "evidence_proof_sample": market.proof_sample,
+            "resolution_attempts": int(market.resolution_attempts),
+            "yes_pool": str(market.yes_pool),
+            "no_pool": str(market.no_pool),
+            "total_volume": str(total_volume),
+            "total_yes_stake": str(market.yes_pool),
+            "total_no_stake": str(market.no_pool),
+            "total_pool_volume": str(total_volume),
+            "total_claims_paid": str(claims_paid),
+            "remaining_pool": str(rem_pool),
+            "remaining_payout_pool": str(rem_pool),
+            "unclaimed_winners_count": int(market.unclaimed_winners_count),
+            "yes_stakers_count": int(market.yes_stakers_count),
+            "no_stakers_count": int(market.no_stakers_count),
             "yes_percent": yes_percent,
             "no_percent": no_percent,
-            "resolution_attempts": int(m.resolution_attempts),
-            "resolved_at_iso": m.resolved_at_iso,
-            "consensus_outcome": m.consensus_outcome,
-            "consensus_rationale": m.consensus_rationale,
-            "evidence_proof_hash": m.evidence_proof_hash,
-            "evidence_proof_sample": m.evidence_proof_sample,
+            "created_at": market.created_at,
+            "created_at_iso": market.created_at,
+            "resolved_at": market.resolved_at,
+            "resolved_at_iso": market.resolved_at,
         }
 
     @gl.public.view
-    def get_market_count(self) -> int:
-        """
-        Total count of prediction markets initialized on-chain.
-        """
-        return int(self.market_counter)
+    def get_market(self, market_id: u32) -> dict:
+        market = self._fetch_market_or_revert(market_id)
+        return self._serialize_market(market_id, market)
 
     @gl.public.view
-    def get_user_stake(self, market_id: u32, user_address: Address) -> dict:
-        """
-        Query a user's deposited stake and claim status for a given market.
-        """
-        user_hex = user_address.as_hex if hasattr(user_address, "as_hex") else "0x" + user_address.hex()
-        stake_key = f"{market_id}:{user_hex}"
-        record = self.user_stakes.get(stake_key, None)
-        if record is None:
-            return {
-                "yes_stake": "0",
-                "no_stake": "0",
-                "claimed": False,
-                "claimable_amount": "0",
-            }
-            
+    def get_market_count(self) -> u32:
+        return u32(len(self.markets))
+
+    @gl.public.view
+    def list_market_ids(self) -> list:
+        return [int(mid) for mid in self.markets.keys()]
+
+    @gl.public.view
+    def get_stake(self, market_id: u32, side: str, staker: str) -> u256:
+        staker_addr = _normalize_address(staker)
+        return self.stakes.get(self._format_stake_key(market_id, side, staker_addr), u256(0))
+
+    @gl.public.view
+    def get_claimable_amount(self, market_id: u32, staker: str) -> u256:
+        if market_id not in self.markets:
+            return u256(0)
+        market = self.markets[market_id]
+        staker_addr = _normalize_address(staker)
+        claim_key = self._format_claim_key(market_id, staker_addr)
+
+        if self.has_claimed.get(claim_key, False):
+            return u256(0)
+
+        rem_pool = int(self.remaining_payout_pool.get(market_id, u256(0)))
+        total_volume = int(market.yes_pool) + int(market.no_pool)
+
+        if market.status == STATUS_RESOLVED_YES:
+            user_stake = int(self.stakes.get(self._format_stake_key(market_id, "YES", staker_addr), u256(0)))
+            if user_stake == 0 or market.yes_pool == u256(0):
+                return u256(0)
+            if int(market.unclaimed_winners_count) <= 1:
+                return u256(rem_pool)
+            payout = (user_stake * total_volume) // int(market.yes_pool)
+            return u256(min(payout, rem_pool))
+
+        elif market.status == STATUS_RESOLVED_NO:
+            user_stake = int(self.stakes.get(self._format_stake_key(market_id, "NO", staker_addr), u256(0)))
+            if user_stake == 0 or market.no_pool == u256(0):
+                return u256(0)
+            if int(market.unclaimed_winners_count) <= 1:
+                return u256(rem_pool)
+            payout = (user_stake * total_volume) // int(market.no_pool)
+            return u256(min(payout, rem_pool))
+
+        elif market.status in (STATUS_ANNULLED, STATUS_ABANDONED):
+            yes_stake = int(self.stakes.get(self._format_stake_key(market_id, "YES", staker_addr), u256(0)))
+            no_stake = int(self.stakes.get(self._format_stake_key(market_id, "NO", staker_addr), u256(0)))
+            return u256(min(yes_stake + no_stake, rem_pool))
+
+        return u256(0)
+
+    @gl.public.view
+    def get_user_stake(self, market_id: u32, user_address: str) -> dict:
+        staker_addr = _normalize_address(user_address)
+        yes_stake = self.stakes.get(self._format_stake_key(market_id, "YES", staker_addr), u256(0))
+        no_stake = self.stakes.get(self._format_stake_key(market_id, "NO", staker_addr), u256(0))
+        claim_key = self._format_claim_key(market_id, staker_addr)
+        claimed = self.has_claimed.get(claim_key, False)
         claimable = self.get_claimable_amount(market_id, user_address)
         return {
-            "yes_stake": str(record.yes_stake),
-            "no_stake": str(record.no_stake),
-            "claimed": record.claimed,
+            "yes_stake": str(yes_stake),
+            "no_stake": str(no_stake),
+            "claimed": claimed,
             "claimable_amount": str(claimable),
         }
 
     @gl.public.view
-    def get_claimable_amount(self, market_id: u32, user_address: Address) -> u256:
-        """
-        Compute the precise claimable amount for a participant in O(1).
-        """
-        if market_id >= self.market_counter:
-            return u256(0)
-            
-        m = self.markets[market_id]
-        user_hex = user_address.as_hex if hasattr(user_address, "as_hex") else "0x" + user_address.hex()
-        stake_key = f"{market_id}:{user_hex}"
-        record = self.user_stakes.get(stake_key, None)
-        
-        if record is None or record.claimed:
-            return u256(0)
-            
-        if m.status == STATUS_RESOLVED_YES:
-            if record.yes_stake > 0 and m.total_yes_stake > 0:
-                if m.unclaimed_winners_count <= 1:
-                    return m.remaining_payout_pool
-                calc = u256((record.yes_stake * m.total_pool_volume) // m.total_yes_stake)
-                return min(calc, m.remaining_payout_pool)
-            return u256(0)
-            
-        elif m.status == STATUS_RESOLVED_NO:
-            if record.no_stake > 0 and m.total_no_stake > 0:
-                if m.unclaimed_winners_count <= 1:
-                    return m.remaining_payout_pool
-                calc = u256((record.no_stake * m.total_pool_volume) // m.total_no_stake)
-                return min(calc, m.remaining_payout_pool)
-            return u256(0)
-            
-        elif m.status in (STATUS_ANNULLED, STATUS_ABANDONED):
-            return u256(record.yes_stake + record.no_stake)
-            
-        return u256(0)
-
-    @gl.public.view
     def get_protocol_summary(self) -> dict:
-        """
-        Protocol-level metrics: total markets, governor, version.
-        """
-        gov_hex = self.governor.as_hex if hasattr(self.governor, "as_hex") else "0x" + self.governor.hex()
         return {
             "version": PROTOCOL_VERSION,
-            "governor": gov_hex,
-            "total_markets": int(self.market_counter),
+            "governor": self.governor.as_hex,
+            "total_markets": len(self.markets),
         }
+
+    @gl.public.view
+    def get_authorized_domains(self) -> list:
+        return list(BASE_TRUSTED_DOMAINS)
+
+
+# ---------------------------------------------------------------------------
+# Module-Level Contract Interface for Native GEN Transfers (EVM Proxy)
+# ---------------------------------------------------------------------------
+
+@gl.evm.contract_interface
+class _Payee:
+    class View:
+        pass
+
+    class Write:
+        pass
