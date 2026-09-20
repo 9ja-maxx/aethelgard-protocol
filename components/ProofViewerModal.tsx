@@ -78,7 +78,7 @@ export const ProofViewerModal: React.FC<ProofViewerModalProps> = ({
               <Hash className="h-3.5 w-3.5 text-cyan-400" />
               <span>Evidence SHA-256 Digest</span>
             </label>
-            <div className="rounded-xl border border-slate-800 bg-obsidian-800/60 p-3 font-mono text-xs text-cyan-300 break-all select-all">
+            <div className="rounded-xl border border-slate-800 bg-obsidian-800/60 p-3 font-mono text-xs text-cyan-300 break-all select-all hover:bg-slate-800 transition-colors cursor-pointer">
               {market.evidence_proof_hash || "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}
             </div>
           </div>
