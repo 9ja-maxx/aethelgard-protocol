@@ -81,7 +81,7 @@ async function main() {
       const tx = await client.writeContract({
         address: CONTRACT_ADDRESS,
         functionName: "create_market",
-        args: [m.title, m.criteria, deadline, m.primaryUrl, m.secondaryUrl],
+        args: [m.title, m.criteria, m.primaryUrl, m.secondaryUrl, deadline],
       });
       console.log(`  -> Market created! Tx hash: ${tx}`);
     } catch (err) {
