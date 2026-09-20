@@ -1,0 +1,7 @@
+contracts:
+  - path: contracts/AethelgardMarket.py
+    name: AethelgardMarket
+test_runner:
+  pytest_args:
+    - -v
+    - tests/direct
