@@ -606,3 +606,34 @@ def test_html_content_sanitization(direct_deploy):
     assert "Navigation Menu" not in clean
     assert "Copyright" not in clean
     assert "Substantive article paragraph confirming outcome." in clean
+
+def test_high_precision_payout_math(direct_deploy, direct_vm, accounts):
+    contract = _deploy(direct_deploy)
+    m_id = _create_sample_market(direct_vm, contract, accounts[0])
+    winner = accounts[1]
+    loser = accounts[2]
+    
+    # 5.555 GEN on YES, 4.445 GEN on NO
+    stake_yes_wei = 5_555_000_000_000_000_000
+    stake_no_wei = 4_445_000_000_000_000_000
+    
+    with direct_vm.as_account(winner):
+        contract.stake_yes(m_id, value=stake_yes_wei)
+    with direct_vm.as_account(loser):
+        contract.stake_no(m_id, value=stake_no_wei)
+        
+    warp_to(direct_vm, T_POST_DEADLINE)
+    _mock_oracle_verdict(direct_vm, "YES")
+    contract.resolve_market(m_id)
+    
+    with direct_vm.as_account(winner):
+        payout = contract.claim_payout(m_id)
+    assert payout == stake_yes_wei + stake_no_wei
+
+
+def test_unauthorized_governance_rejection(direct_deploy, direct_vm, accounts):
+    contract = _deploy(direct_deploy)
+    non_gov = accounts[3]
+    with direct_vm.as_account(non_gov):
+        with pytest.raises(Exception, match="Only governor"):
+            contract.deprecate_trusted_domain("reuters.com")
