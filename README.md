@@ -14,9 +14,9 @@
 | Parameter | Value |
 | :--- | :--- |
 | **Network** | GenLayer StudioNet (Chain ID: `61999`) |
-| **Deployed Contract Address** | [`0xA724D3D1d898343f53F9610cf28Bb6f19Ef82892`](https://explorer-studio.genlayer.com/address/0xA724D3D1d898343f53F9610cf28Bb6f19Ef82892) |
+| **Deployed Contract Address** | [`0xf4a7aD1EBBF6Fe00e2f3fd1b77761aE7d7D32b08`](https://explorer-studio.genlayer.com/address/0xf4a7aD1EBBF6Fe00e2f3fd1b77761aE7d7D32b08) |
 | **Intelligent Contract** | [`contracts/AethelgardMarket.py`](contracts/AethelgardMarket.py) |
-| **Explorer** | [View on GenLayer Studio Explorer](https://explorer-studio.genlayer.com/address/0xA724D3D1d898343f53F9610cf28Bb6f19Ef82892) |
+| **Explorer** | [View on GenLayer Studio Explorer](https://explorer-studio.genlayer.com/address/0xf4a7aD1EBBF6Fe00e2f3fd1b77761aE7d7D32b08) |
 | **GenVM Runner** | `py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6` |
 | **Status** | Live & Verified on StudioNet |
 
