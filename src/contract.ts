@@ -4,7 +4,7 @@ import { parseEther } from "viem";
 import { Market, UserStake, ProtocolSummary } from "./types";
 
 export const CONTRACT_ADDRESS =
-  process.env.NEXT_PUBLIC_GENLAYER_CONTRACT_ADDRESS || "0x45469A47EfE115CA341F9129168F056011C2c50f";
+  process.env.NEXT_PUBLIC_GENLAYER_CONTRACT_ADDRESS || "0xA724D3D1d898343f53F9610cf28Bb6f19Ef82892";
 
 export function getGenLayerClient(accountOrAddress?: any, provider?: any) {
   const currentProvider =

@@ -4,7 +4,7 @@
 const { createClient } = require("genlayer-js");
 const { studionet } = require("genlayer-js/chains");
 
-const CONTRACT_ADDRESS = process.env.NEXT_PUBLIC_GENLAYER_CONTRACT_ADDRESS || "0x45469A47EfE115CA341F9129168F056011C2c50f";
+const CONTRACT_ADDRESS = process.env.NEXT_PUBLIC_GENLAYER_CONTRACT_ADDRESS || "0xA724D3D1d898343f53F9610cf28Bb6f19Ef82892";
 
 async function main() {
   console.log("Connecting to GenLayer StudioNet...");
