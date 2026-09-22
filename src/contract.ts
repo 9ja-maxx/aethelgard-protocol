@@ -6,11 +6,28 @@ import { Market, UserStake, ProtocolSummary } from "./types";
 export const CONTRACT_ADDRESS =
   process.env.NEXT_PUBLIC_GENLAYER_CONTRACT_ADDRESS || "0x45469A47EfE115CA341F9129168F056011C2c50f";
 
-export function getGenLayerClient(account?: any) {
+export function getGenLayerClient(accountOrAddress?: any, provider?: any) {
+  const currentProvider =
+    provider || (typeof window !== "undefined" ? (window as any).ethereum : undefined);
   return createClient({
     chain: studionet,
-    account: account,
+    account: accountOrAddress,
+    provider: currentProvider,
   });
+}
+
+export async function fetchProtocolSummary(client: any): Promise<ProtocolSummary | null> {
+  try {
+    const res = await client.readContract({
+      address: CONTRACT_ADDRESS,
+      functionName: "get_protocol_summary",
+      args: [],
+    });
+    return res as ProtocolSummary;
+  } catch (err) {
+    console.error("fetchProtocolSummary error:", err);
+    return null;
+  }
 }
 
 export async function fetchMarketCount(client: any): Promise<number> {
@@ -55,53 +72,59 @@ export async function fetchUserStake(client: any, marketId: number, userAddress:
   }
 }
 
-export async function stakeYes(client: any, marketId: number, amountGen: string) {
+export async function stakeYes(client: any, marketId: number, amountGen: string, accountOrAddress?: any) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "stake_yes",
     args: [marketId],
     value: parseEther(amountGen),
+    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
-export async function stakeNo(client: any, marketId: number, amountGen: string) {
+export async function stakeNo(client: any, marketId: number, amountGen: string, accountOrAddress?: any) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "stake_no",
     args: [marketId],
     value: parseEther(amountGen),
+    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
-export async function resolveMarket(client: any, marketId: number) {
+export async function resolveMarket(client: any, marketId: number, accountOrAddress?: any) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "resolve_market",
     args: [marketId],
+    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
-export async function claimPayout(client: any, marketId: number) {
+export async function claimPayout(client: any, marketId: number, accountOrAddress?: any) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "claim_payout",
     args: [marketId],
+    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
-export async function claimRefund(client: any, marketId: number) {
+export async function claimRefund(client: any, marketId: number, accountOrAddress?: any) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "claim_refund",
     args: [marketId],
+    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
-export async function claimStaleRefund(client: any, marketId: number) {
+export async function claimStaleRefund(client: any, marketId: number, accountOrAddress?: any) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "claim_stale_market_refund",
     args: [marketId],
+    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
@@ -111,11 +134,13 @@ export async function createMarket(
   criteria: string,
   deadlineIso: string,
   primaryUrl: string,
-  secondaryUrl: string = ""
+  secondaryUrl: string = "",
+  accountOrAddress?: any
 ) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "create_market",
     args: [title, criteria, primaryUrl, secondaryUrl, deadlineIso],
+    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }

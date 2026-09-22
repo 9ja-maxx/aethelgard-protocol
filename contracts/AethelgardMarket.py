@@ -164,13 +164,39 @@ def _get_execution_timestamp_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _parse_iso_string(iso_str: str) -> datetime:
-    return datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+def _parse_iso_to_utc_datetime(iso_str: str) -> datetime:
+    """
+    Robustly parses any ISO-8601 string with any timezone offset into an explicit UTC datetime.
+    Supports 'Z', 'z', and numeric offsets (+HH:MM, -HH:MM, +HHMM, -HHMM).
+    """
+    cleaned = iso_str.strip()
+    if cleaned.endswith("Z") or cleaned.endswith("z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    dt = datetime.fromisoformat(cleaned)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _to_canonical_instant_ts(iso_str: str) -> float:
+    """
+    Returns the canonical UTC epoch timestamp in seconds for any ISO-8601 string.
+    Enforces mathematically consistent instant comparisons across diverse timezone offsets.
+    """
+    return _parse_iso_to_utc_datetime(iso_str).timestamp()
+
+
+def _to_canonical_utc_iso(iso_str: str) -> str:
+    """
+    Normalizes any valid ISO-8601 timestamp string into canonical UTC ISO-8601 representation (YYYY-MM-DDTHH:MM:SSZ).
+    """
+    dt = _parse_iso_to_utc_datetime(iso_str)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _seconds_elapsed(start_iso: str, end_iso: str) -> float:
     try:
-        return (_parse_iso_string(end_iso) - _parse_iso_string(start_iso)).total_seconds()
+        return _to_canonical_instant_ts(end_iso) - _to_canonical_instant_ts(start_iso)
     except Exception:
         return -1.0
 
@@ -340,9 +366,16 @@ class AethelgardMarket(gl.Contract):
                 raise gl.vm.UserError("UNAUTHORIZED_SOURCE: Secondary source domain is not in the trusted registry")
 
         current_time = _get_execution_timestamp_iso()
-        elapsed_to_deadline = _seconds_elapsed(current_time, deadline)
-        if elapsed_to_deadline < MIN_DURATION_SECONDS:
+        now_ts = _to_canonical_instant_ts(current_time)
+        try:
+            deadline_ts = _to_canonical_instant_ts(deadline)
+        except Exception:
+            raise gl.vm.UserError("INVALID_DEADLINE: Malformed ISO-8601 timestamp string")
+
+        if deadline_ts - now_ts < MIN_DURATION_SECONDS:
             raise gl.vm.UserError("INVALID_DEADLINE: Deadline must be at least 1 hour into the future")
+
+        canonical_deadline = _to_canonical_utc_iso(deadline)
 
         market_id = self.next_market_id
         self.next_market_id = u32(int(market_id) + 1)
@@ -354,7 +387,7 @@ class AethelgardMarket(gl.Contract):
             criteria=criteria.strip(),
             primary_url=primary_url.strip(),
             secondary_url=secondary_url.strip() if secondary_url else "",
-            deadline=deadline,
+            deadline=canonical_deadline,
             status=STATUS_ACTIVE,
             outcome=OUTCOME_PENDING,
             rationale="",
@@ -384,7 +417,9 @@ class AethelgardMarket(gl.Contract):
             raise gl.vm.UserError("MARKET_NOT_OPEN: Market is not active for staking")
 
         current_time = _get_execution_timestamp_iso()
-        if current_time >= market.deadline:
+        now_ts = _to_canonical_instant_ts(current_time)
+        deadline_ts = _to_canonical_instant_ts(market.deadline)
+        if now_ts >= deadline_ts:
             raise gl.vm.UserError("DEADLINE_EXPIRED: Staking window has closed")
 
         stake_value = gl.message.value
@@ -429,7 +464,9 @@ class AethelgardMarket(gl.Contract):
             raise gl.vm.UserError("INVALID_STATE: Market is already settled or finalized")
 
         current_time = _get_execution_timestamp_iso()
-        if current_time < market.deadline:
+        now_ts = _to_canonical_instant_ts(current_time)
+        deadline_ts = _to_canonical_instant_ts(market.deadline)
+        if now_ts < deadline_ts:
             raise gl.vm.UserError("PREMATURE_RESOLUTION: Cannot resolve before the deadline has passed")
 
         market.status = STATUS_PENDING
@@ -668,7 +705,9 @@ Output true if the categorical outcomes are identical; otherwise false."""
                 raise gl.vm.UserError("ABANDON_RESTRICTED: Requires at least 2 failed resolution attempts")
 
             current_time = _get_execution_timestamp_iso()
-            if _seconds_elapsed(market.deadline, current_time) < ABANDON_TIMEOUT_SECONDS:
+            now_ts = _to_canonical_instant_ts(current_time)
+            deadline_ts = _to_canonical_instant_ts(market.deadline)
+            if now_ts - deadline_ts < ABANDON_TIMEOUT_SECONDS:
                 raise gl.vm.UserError("ABANDON_RESTRICTED: 72-hour grace period has not elapsed")
 
             # Transition to ABANDONED
@@ -721,7 +760,7 @@ Output true if the categorical outcomes are identical; otherwise false."""
         status_code = status_map.get(market.status, 0)
         deadline_ts = 0
         try:
-            deadline_ts = int(_parse_iso_string(market.deadline).timestamp())
+            deadline_ts = int(_to_canonical_instant_ts(market.deadline))
         except Exception:
             deadline_ts = 0
 

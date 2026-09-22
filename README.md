@@ -69,9 +69,9 @@ If source websites experience permanent outages or Cloudflare barriers, particip
 
 ---
 
-## The Draconic Sentinel Consensus Architecture
+## The Aethelgard Sentinel Consensus Architecture
 
-The following flow chart illustrates the end-to-end consensus and settlement lifecycle through the Draconic Sentinel framework:
+The following flow chart illustrates the end-to-end consensus and settlement lifecycle through the Aethelgard Sentinel framework:
 
 ```mermaid
 graph TD
@@ -89,14 +89,14 @@ graph TD
         I --> J
     end
 
-    subgraph The Draconic Eye Live Ingestion
+    subgraph Autonomous Live Ingestion
         K[Resolution Deadline Arrives] --> L[resolve_market Triggered]
         L --> M[gl.nondet.web.get]
         M -->|Raw HTML Payloads| N[In-Contract Regex Sanitizer]
         N -->|Strip Script / Style / Chrome| O[Cleaned Semantic Evidence]
     end
 
-    subgraph The Council of Wyrms Consensus Deliberation
+    subgraph Multi-Validator Consensus Deliberation
         O --> P[<<<UNTRUSTED_WEB_EVIDENCE>>> Sandbox]
         P --> Q[gl.nondet.exec_prompt]
         Q --> R[Independent Validator Opinions]
