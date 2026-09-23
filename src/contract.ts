@@ -72,59 +72,53 @@ export async function fetchUserStake(client: any, marketId: number, userAddress:
   }
 }
 
-export async function stakeYes(client: any, marketId: number, amountGen: string, accountOrAddress?: any) {
+export async function stakeYes(client: any, marketId: number, amountGen: string) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "stake_yes",
     args: [marketId],
     value: parseEther(amountGen),
-    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
-export async function stakeNo(client: any, marketId: number, amountGen: string, accountOrAddress?: any) {
+export async function stakeNo(client: any, marketId: number, amountGen: string) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "stake_no",
     args: [marketId],
     value: parseEther(amountGen),
-    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
-export async function resolveMarket(client: any, marketId: number, accountOrAddress?: any) {
+export async function resolveMarket(client: any, marketId: number) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "resolve_market",
     args: [marketId],
-    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
-export async function claimPayout(client: any, marketId: number, accountOrAddress?: any) {
+export async function claimPayout(client: any, marketId: number) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "claim_payout",
     args: [marketId],
-    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
-export async function claimRefund(client: any, marketId: number, accountOrAddress?: any) {
+export async function claimRefund(client: any, marketId: number) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "claim_refund",
     args: [marketId],
-    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
-export async function claimStaleRefund(client: any, marketId: number, accountOrAddress?: any) {
+export async function claimStaleRefund(client: any, marketId: number) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "claim_stale_market_refund",
     args: [marketId],
-    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
@@ -134,13 +128,11 @@ export async function createMarket(
   criteria: string,
   deadlineIso: string,
   primaryUrl: string,
-  secondaryUrl: string = "",
-  accountOrAddress?: any
+  secondaryUrl: string = ""
 ) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "create_market",
     args: [title, criteria, primaryUrl, secondaryUrl, deadlineIso],
-    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }

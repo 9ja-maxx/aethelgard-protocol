@@ -37,59 +37,53 @@ function getGenLayerClient(accountOrAddress, provider) {
 }
 
 // Helpers replicating src/contract.ts write action wrappers
-async function stakeYes(client, marketId, amountGen, accountOrAddress) {
+async function stakeYes(client, marketId, amountGen) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "stake_yes",
     args: [marketId],
     value: parseEther(amountGen),
-    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
-async function stakeNo(client, marketId, amountGen, accountOrAddress) {
+async function stakeNo(client, marketId, amountGen) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "stake_no",
     args: [marketId],
     value: parseEther(amountGen),
-    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
-async function resolveMarket(client, marketId, accountOrAddress) {
+async function resolveMarket(client, marketId) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "resolve_market",
     args: [marketId],
-    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
-async function claimPayout(client, marketId, accountOrAddress) {
+async function claimPayout(client, marketId) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "claim_payout",
     args: [marketId],
-    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
-async function claimRefund(client, marketId, accountOrAddress) {
+async function claimRefund(client, marketId) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "claim_refund",
     args: [marketId],
-    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
-async function claimStaleRefund(client, marketId, accountOrAddress) {
+async function claimStaleRefund(client, marketId) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "claim_stale_market_refund",
     args: [marketId],
-    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
@@ -99,14 +93,12 @@ async function createMarket(
   criteria,
   deadlineIso,
   primaryUrl,
-  secondaryUrl = "",
-  accountOrAddress
+  secondaryUrl = ""
 ) {
   return client.writeContract({
     address: CONTRACT_ADDRESS,
     functionName: "create_market",
     args: [title, criteria, primaryUrl, secondaryUrl, deadlineIso],
-    ...(accountOrAddress ? { account: accountOrAddress } : {}),
   });
 }
 
@@ -150,16 +142,33 @@ async function runSignedActionsTests() {
     removeListener: () => {},
   };
   const browserClient = getGenLayerClient(EXPECTED_ADDRESS, mockEthereum);
-  assert(browserClient, "Browser client must be created successfully");
+  assert(browserClient.account, "Browser client must hold configured account");
+  assert.strictEqual(
+    browserClient.account.address.toLowerCase(),
+    EXPECTED_ADDRESS.toLowerCase(),
+    "Browser client account address must match connected wallet address"
+  );
   console.log("✓ GenLayer client configured with browser wallet provider and connected account");
 
-  // 4. Test write actions interceptor to verify signed account path
+  // 4. Test write actions on client with signing account (no redundant per-call account override)
   const writeCalls = [];
-  const testClient = {
-    writeContract: async (params) => {
-      writeCalls.push(params);
-      return `0xhash_${params.functionName}`;
-    },
+  const testClient = getGenLayerClient(account);
+  testClient.writeContract = async (params) => {
+    // Assert client holds the signing account
+    assert(testClient.account, "Client must possess attached signing account");
+    assert.strictEqual(
+      testClient.account.address.toLowerCase(),
+      EXPECTED_ADDRESS.toLowerCase(),
+      "Client account must match expected signing account"
+    );
+    // CRITICAL: Ensure write wrapper does NOT pass a redundant per-call account string
+    assert.strictEqual(
+      params.account,
+      undefined,
+      "Write wrapper must NOT pass a per-call account override (prevents SDK invalid-address error)"
+    );
+    writeCalls.push(params);
+    return `0xhash_${params.functionName}`;
   };
 
   // Test createMarket
@@ -169,69 +178,61 @@ async function runSignedActionsTests() {
     "Resolves YES if NASA officially reports crewed lunar touchdown.",
     "2026-12-31T23:59:59Z",
     "https://www.nasa.gov/artemis-iii",
-    "https://en.wikipedia.org/wiki/Artemis_3",
-    account.address
+    "https://en.wikipedia.org/wiki/Artemis_3"
   );
   const createCall = writeCalls[writeCalls.length - 1];
   assert.strictEqual(createCall.functionName, "create_market");
-  assert.strictEqual(createCall.account, account.address, "createMarket must pass signed account");
   assert.strictEqual(createCall.args[0], "Will Artemis III land astronauts on the Moon by December 2026?");
-  console.log("✓ createMarket passed signed account path to writeContract");
+  console.log("✓ createMarket executed via client's signed account (no per-call override)");
 
   // Test stakeYes
-  await stakeYes(testClient, 0, "2.5", account.address);
+  await stakeYes(testClient, 0, "2.5");
   const stakeYesCall = writeCalls[writeCalls.length - 1];
   assert.strictEqual(stakeYesCall.functionName, "stake_yes");
-  assert.strictEqual(stakeYesCall.account, account.address, "stakeYes must pass signed account");
   assert.strictEqual(stakeYesCall.value, parseEther("2.5"));
-  console.log("✓ stakeYes passed signed account path and correct parseEther value");
+  console.log("✓ stakeYes executed via client's signed account with correct parseEther value");
 
   // Test stakeNo
-  await stakeNo(testClient, 0, "1.0", account.address);
+  await stakeNo(testClient, 0, "1.0");
   const stakeNoCall = writeCalls[writeCalls.length - 1];
   assert.strictEqual(stakeNoCall.functionName, "stake_no");
-  assert.strictEqual(stakeNoCall.account, account.address, "stakeNo must pass signed account");
   assert.strictEqual(stakeNoCall.value, parseEther("1.0"));
-  console.log("✓ stakeNo passed signed account path and correct parseEther value");
+  console.log("✓ stakeNo executed via client's signed account with correct parseEther value");
 
   // Test resolveMarket
-  await resolveMarket(testClient, 0, account.address);
+  await resolveMarket(testClient, 0);
   const resolveCall = writeCalls[writeCalls.length - 1];
   assert.strictEqual(resolveCall.functionName, "resolve_market");
-  assert.strictEqual(resolveCall.account, account.address, "resolveMarket must pass signed account");
   assert.deepStrictEqual(resolveCall.args, [0]);
-  console.log("✓ resolveMarket passed signed account path to writeContract");
+  console.log("✓ resolveMarket executed via client's signed account");
 
   // Test claimPayout
-  await claimPayout(testClient, 0, account.address);
+  await claimPayout(testClient, 0);
   const claimPayoutCall = writeCalls[writeCalls.length - 1];
   assert.strictEqual(claimPayoutCall.functionName, "claim_payout");
-  assert.strictEqual(claimPayoutCall.account, account.address, "claimPayout must pass signed account");
-  console.log("✓ claimPayout passed signed account path to writeContract");
+  console.log("✓ claimPayout executed via client's signed account");
 
   // Test claimRefund
-  await claimRefund(testClient, 0, account.address);
+  await claimRefund(testClient, 0);
   const claimRefundCall = writeCalls[writeCalls.length - 1];
   assert.strictEqual(claimRefundCall.functionName, "claim_refund");
-  assert.strictEqual(claimRefundCall.account, account.address, "claimRefund must pass signed account");
-  console.log("✓ claimRefund passed signed account path to writeContract");
+  console.log("✓ claimRefund executed via client's signed account");
 
   // Test claimStaleRefund
-  await claimStaleRefund(testClient, 0, account.address);
+  await claimStaleRefund(testClient, 0);
   const claimStaleCall = writeCalls[writeCalls.length - 1];
   assert.strictEqual(claimStaleCall.functionName, "claim_stale_market_refund");
-  assert.strictEqual(claimStaleCall.account, account.address, "claimStaleRefund must pass signed account");
-  console.log("✓ claimStaleRefund passed signed account path to writeContract");
+  console.log("✓ claimStaleRefund executed via client's signed account");
 
   // Assert all 7 write actions were verified
   assert.strictEqual(writeCalls.length, 7, "All 7 write actions must have executed");
   for (const call of writeCalls) {
-    assert(call.account, `Write call to ${call.functionName} must include an account parameter`);
     assert.strictEqual(call.address, CONTRACT_ADDRESS);
+    assert.strictEqual(call.account, undefined, "Per-call account override must be omitted");
   }
 
   console.log("\n========================================================");
-  console.log("All 7 write actions verified on signed account path! ✓");
+  console.log("All 7 write actions verified on signed client account! ✓");
   console.log("========================================================\n");
 }
 
